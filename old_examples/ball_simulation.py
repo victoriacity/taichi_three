@@ -6,7 +6,9 @@ ti.init(ti.opengl)
 N = 12
 dt = 0.01
 
-scene = t3.SceneRT((640, 640))
+scene = t3.SceneRT()
+camera = t3.Camera()
+scene.add_camera(camera)
 pos = ti.Vector(3, ti.f32, N)
 vel = ti.Vector(3, ti.f32, N)
 radius = ti.var(ti.f32, N)
@@ -54,12 +56,12 @@ def substep():
         pos[i] += vel[i] * dt
 
 init()
-gui = ti.GUI('Balls', scene.res)
+gui = ti.GUI('Balls', camera.res)
 while gui.running:
     gui.running = not gui.get_event(ti.GUI.ESCAPE)
     for i in range(4):
         substep()
-    scene.camera.from_mouse(gui, dis=4)
+    camera.from_mouse(gui)
     scene.render()
     gui.set_image(scene.img)
     gui.show()

@@ -79,7 +79,7 @@ class SceneRTBase(Scene):
         orig, dir = camera.generate(coor)
 
         pos, normal = self.trace(orig, dir)
-        light_dir = self.light_dir[None]
+        light_dir = self.lights[0].dir[None]
 
         color = self.opt.render_func(pos, normal, dir, light_dir)
         color = self.opt.pre_process(color)
