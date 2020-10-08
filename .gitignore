@@ -8,3 +8,8 @@ __pycache__
 /tags
 /.idea
 /*.ipynb
+/.vscode
+node_modules/
+/docs/_media/container*.png
+package-lock.json
+/games
