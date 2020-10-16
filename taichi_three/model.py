@@ -9,169 +9,277 @@ import math
 
 
 @ti.data_oriented
-class ModelBase(AutoInit):
+class ModelBase:
     def __init__(self):
-        self.L2W = Affine.field(())
-        self.init_cbs = []
-
-    def _init(self):
-        self.L2W.init()
-        for cb in self.init_cbs:
-            cb()
-
-
-class ModelLow(ModelBase):
-    def __init__(self, faces_n, pos_n, tex_n, nrm_n):
-        super().__init__()
-
-        self.faces = ti.Matrix.field(3, 3, int, faces_n)
-        self.pos = ti.Vector.field(3, float, pos_n)
-        self.tex = ti.Vector.field(2, float, tex_n)
-        self.nrm = ti.Vector.field(3, float, nrm_n)
-
-        self.textures = {}
-        self.shading_type = CookTorrance
-
-    @ti.func
-    def render(self, camera):
-        for i in ti.grouped(self.faces):
-            # assume all elements to be triangle
-            render_triangle(self, camera, self.faces[i])
-
-    @ti.func
-    def intersect(self, camera, I, orig, dir):
-        for i in range(self.faces.shape[0]):
-            intersect_triangle(self, camera, I, orig, dir, self.faces[i])
-
-    @classmethod
-    def from_obj(cls, obj, texture=None, normtex=None):
-        model = cls(len(obj['f']), len(obj['vp']), len(obj['vt']), len(obj['vn']))
-
-        def obj_init_cb():
-            model.faces.from_numpy(obj['f'])
-            model.pos.from_numpy(obj['vp'])
-            model.tex.from_numpy(obj['vt'])
-            model.nrm.from_numpy(obj['vn'])
-
-        model.init_cbs.append(obj_init_cb)
-
-        if texture is not None:
-            model.add_texture('color', texture)
-        if normtex is not None:
-            model.add_texture('normal', normtex)
-        return model
-
-    def add_texture(self, name, texture):
-        assert name not in self.textures, name
-
-        # convert UInt8 into Float32 for storage:
-        if texture.dtype == np.uint8:
-            texture = texture.astype(np.float32) / 255
-        elif texture.dtype == np.float64:
-            texture = texture.astype(np.float32)
-
-        # normal maps are stored as [-1, 1] for maximizing FP precision:
-        if name == 'normal':
-            texture = texture * 2 - 1
-
-        if len(texture.shape) == 3 and texture.shape[2] == 1:
-            texture = texture.reshape(texture.shape[:2])
-
-        # either RGB or greyscale
-        if len(texture.shape) == 2:
-            self.textures[name] = ti.field(float, texture.shape)
-
-        else:
-            assert len(texture.shape) == 3, texture.shape
-            texture = texture[:, :, :3]
-            assert texture.shape[2] == 3, texture.shape
-
-            self.textures[name] = ti.Vector.field(3, float, texture.shape[:2])
-
-        def other_init_cb():
-            self.textures[name].from_numpy(texture)
-
-        self.init_cbs.append(other_init_cb)
-
-    def add_uniform(self, name, value):
-        self.add_texture(name, np.array([[value]]))
-
-    @ti.func
-    def sample(self, name: ti.template(), texcoor, default):
-        if ti.static(name in self.textures.keys()):
-            tex = ti.static(self.textures[name])
-            return ts.bilerp(tex, texcoor * ts.vec(*tex.shape))
-        else:
-            return default
-
-    def colorize(self, pos, texcoor, normal):
-        opt = self.shading_type()
-        opt.model = self
-        for key in opt.parameters:
-            setattr(opt, key, self.sample(key, texcoor, getattr(opt, key)))
-        return opt.colorize(pos, normal)
-
-    @ti.func
-    def pixel_shader(self, pos, color, texcoor, normal):
-        color = color * self.sample('color', texcoor, ts.vec3(1.0))
-        return dict(img=color, pos=pos, normal=normal)
-
-    @ti.func
-    def vertex_shader(self, pos, texcoor, normal, tangent, bitangent):
-        color = self.colorize(pos, texcoor, normal)
-        return pos, color, texcoor, normal
-
-
-class SimpleModel(ModelBase):
-    def __init__(self, faces_n, pos_n):
-        super().__init__()
-
-        self.pos = ti.Vector.field(3, float, pos_n)
-        self.clr = ti.Vector.field(3, float, pos_n)
-        self.faces = ti.Vector.field(3, int, faces_n)
+        self.L2W = ti.Matrix.field(4, 4, float, ())
+        self.L2C = ti.Matrix.field(4, 4, float, ())
 
         @ti.materialize_callback
-        def initialize_clr():
-            self.clr.fill(1.0)
+        @ti.kernel
+        def init_L2W():
+            self.L2W[None] = ti.Matrix.identity(float, 4)
+            self.L2C[None] = ti.Matrix.identity(float, 4)
+
+        self.material = Material(CookTorrance())
+
+    @ti.func
+    def set_view(self, camera):
+        self.L2C[None] = camera.L2W[None].inverse() @ self.L2W[None]
+
+
+@ti.data_oriented
+class IndicedFace:
+    def __init__(self, face, postab, textab, nrmtab):
+        self.face = face
+        self.postab = postab
+        self.textab = textab
+        self.nrmtab = nrmtab
+
+    @property
+    @ti.func
+    def pos(self):
+        return self.postab[self.face[0, 0]], self.postab[self.face[1, 0]], self.postab[self.face[2, 0]]
+
+    @property
+    @ti.func
+    def tex(self):
+        return self.textab[self.face[0, 1]], self.textab[self.face[1, 1]], self.textab[self.face[2, 1]]
+
+    @property
+    @ti.func
+    def nrm(self):
+        return self.nrmtab[self.face[0, 2]], self.nrmtab[self.face[1, 2]], self.nrmtab[self.face[2, 2]]
+
+
+@ti.data_oriented
+class Mesh:
+    def __init__(self, faces, pos, tex, nrm):
+        self.faces = faces
+        self.pos = pos
+        self.tex = tex
+        self.nrm = nrm
+
+    @property
+    def shape(self):
+        return self.faces.shape
+
+    @property
+    def static_shape(self):
+        return []
+
+    def before_rendering(self):
+        pass
+
+    @ti.func
+    def get_face(self, i, j: ti.template()):
+        return IndicedFace(self.faces[i], self.pos, self.tex, self.nrm)
+
+    @classmethod
+    def from_obj(cls, obj):
+        if isinstance(obj, str):
+            from .loader import readobj
+            obj = readobj(obj)
+
+        faces = create_field((3, 3), int, len(obj['f']))
+        pos = create_field(3, float, len(obj['vp']))
+        tex = create_field(2, float, len(obj['vt']))
+        nrm = create_field(3, float, len(obj['vn']))
+
+        @ti.materialize_callback
+        def init_mesh_data():
+            faces.from_numpy(obj['f'])
+            pos.from_numpy(obj['vp'])
+            tex.from_numpy(obj['vt'])
+            nrm.from_numpy(obj['vn'])
+
+        mesh = cls(faces=faces, pos=pos, tex=tex, nrm=nrm)
+        return mesh
+
+
+@ti.data_oriented
+class MeshMakeNormal:
+    @ti.data_oriented
+    class MakeNormalFace:
+        def __init__(self, face):
+            self.face = face
+
+        @property
+        @ti.func
+        def pos(self):
+            return self.face.pos
+
+        @property
+        @ti.func
+        def tex(self):
+            return self.face.tex
+
+        @property
+        @ti.func
+        def nrm(self):
+            posa, posb, posc = self.pos
+            normal = ts.cross(posa - posc, posa - posb)
+            return normal, normal, normal
+
+    def __init__(self, mesh):
+        self.mesh = mesh
+
+    @property
+    def shape(self):
+        return self.mesh.shape
+
+    @property
+    def static_shape(self):
+        return self.mesh.static_shape
+
+    def before_rendering(self):
+        self.mesh.before_rendering()
+
+    @ti.func
+    def get_face(self, i, j: ti.template()):
+        face = self.mesh.get_face(i, j)
+        return self.MakeNormalFace(face)
+
+
+@ti.data_oriented
+class Model(ModelBase):
+    def __init__(self, mesh):
+        super().__init__()
+        self.mesh = mesh
 
     @ti.func
     def render(self, camera):
-        for i in ti.grouped(self.faces):
-            face = ti.Matrix.cols([self.faces[i], self.faces[i], ts.vec3(0)])
-            render_triangle(self, camera, face)
-
-    @subscriptable
-    @ti.func
-    def tex(self, I):
-        return self.clr[I]
-
-    @subscriptable
-    def nrm(self, I):
-        return ts.vec3(0.0, 0.0, -1.0)
+        self.mesh.before_rendering()
+        for i in ti.grouped(ti.ndrange(*self.mesh.shape)):
+            for j in ti.static(ti.grouped(ti.ndrange(*self.mesh.static_shape))):
+                face = self.mesh.get_face(i, j)
+                render_triangle(self, camera, face)
 
     @ti.func
-    def pixel_shader(self, pos, color):
-        return dict(img=color, pos=pos)
+    def intersect(self, orig, dir):
+        hit = 1e6
+        sorig, sdir = orig, dir
+        clr = ts.vec3(0.0)
+        for i in range(self.faces.shape[0]):
+            face = IndicedFace(self.faces[i], self.pos, self.tex, self.nrm)
+            ihit, iorig, idir, iclr = intersect_triangle(self, sorig, sdir, face)
+            if ihit < hit:
+                hit, orig, dir, clr = ihit, iorig, idir, iclr
+        return hit, orig, dir, clr
 
-    @ti.func
-    def vertex_shader(self, pos, texcoor, normal, tangent, bitangent):
-        color = texcoor
-        return pos, color
+    def radiance(self, pos, indir, texcoor, normal, tangent, bitangent):
+        # TODO: we don't support normal maps in path tracing mode for now
+        with self.material.specify_inputs(model=self, pos=pos, texcoor=texcoor, normal=normal, tangent=tangent, bitangent=bitangent, indir=indir) as shader:
+            return shader.radiance()
 
+    def colorize(self, pos, texcoor, normal, tangent, bitangent):
+        with self.material.specify_inputs(model=self, pos=pos, texcoor=texcoor, normal=normal, tangent=tangent, bitangent=bitangent) as shader:
+            return shader.colorize()
 
-class Model(ModelLow):
     @ti.func
     def pixel_shader(self, pos, texcoor, normal, tangent, bitangent):
-        ndir = self.sample('normal', texcoor, ts.vec3(0.0, 0.0, 1.0))
-        normal = ti.Matrix.cols([tangent, bitangent, normal]) @ ndir
         # normal has been no longer normalized due to lerp and ndir errors.
         # so here we re-enforce normalization to get slerp.
         normal = normal.normalized()
-
-        color = self.colorize(pos, texcoor, normal)
-        return dict(img=color, pos=pos, normal=normal,
+        color = self.colorize(pos, texcoor, normal, tangent, bitangent)
+        return dict(img=color, pos=pos, texcoor=texcoor, normal=normal,
                     tangent=tangent, bitangent=bitangent)
 
     @ti.func
     def vertex_shader(self, pos, texcoor, normal, tangent, bitangent):
         return pos, texcoor, normal, tangent, bitangent
+
+
+@ti.data_oriented
+class MeshGrid:
+    @ti.data_oriented
+    class MeshGridFace:
+        def __init__(self, parent, i):
+            self.parent = parent
+            self.i = i
+
+        @property
+        @ti.func
+        def pos(self):
+            return [self.parent.pos[i] for i in [self.i + ts.D.__, self.i + ts.D.x_, self.i + ts.D.xx, self.i + ts.D._x]]
+
+        @property
+        @ti.func
+        def tex(self):
+            return [i / ts.vec2(*self.parent.res) for i in [self.i + ts.D.__, self.i + ts.D.x_, self.i + ts.D.xx, self.i + ts.D._x]]
+
+        @property
+        @ti.func
+        def nrm(self):
+            return [self.parent.snrm[i] for i in [self.i + ts.D.__, self.i + ts.D.x_, self.i + ts.D.xx, self.i + ts.D._x]]
+
+    def __init__(self, res):
+        super().__init__()
+        self.res = res
+        self.pos = ti.Vector.field(3, float, self.res)
+        self.snrm = ti.Vector.field(3, float, self.res)
+
+        @ti.materialize_callback
+        @ti.kernel
+        def init_pos():
+            for i in ti.grouped(self.pos):
+                self.pos[i] = ts.vec(i / ts.vec(*self.pos.shape) * 2 - 1, 0.0).xzy
+
+    @ti.func
+    def before_rendering(self):
+        for i in ti.grouped(self.snrm):
+            self.snrm[i] = self.get_normal_at(i)
+
+    @ti.func
+    def get_normal_at(self, i):
+        xa = self.pos[ts.clamp(i + ts.D.x_, 0, ts.vec2(*self.shape))]
+        xb = self.pos[ts.clamp(i + ts.D.X_, 0, ts.vec2(*self.shape))]
+        ya = self.pos[ts.clamp(i + ts.D._x, 0, ts.vec2(*self.shape))]
+        yb = self.pos[ts.clamp(i + ts.D._X, 0, ts.vec2(*self.shape))]
+        return (ya - yb).cross(xa - xb).normalized()
+
+    @property
+    def shape(self):
+        return [self.res[0] - 1, self.res[1] - 1]
+
+    @property
+    def static_shape(self):
+        return []
+
+    @ti.func
+    def get_face(self, i, j: ti.template()):
+        return self.MeshGridFace(self, i)
+
+
+@ti.data_oriented
+class QuadToTri:
+    def __init__(self, mesh):
+        self.mesh = mesh
+
+    @property
+    def shape(self):
+        return self.mesh.shape
+
+    @property
+    def static_shape(self):
+        return [2, *self.mesh.static_shape]
+
+    def before_rendering(self):
+        self.mesh.before_rendering()
+
+    @ti.func
+    def get_face(self, i, j: ti.template()):
+        face = self.mesh.get_face(i, ts.vec(*[j[_] for _ in range(1, j.n)]))
+        ret = DataOriented()
+        if ti.static(j.x == 0):
+            ret.__dict__.update(
+                pos = [face.pos[i] for i in [0, 1, 2]],
+                tex = [face.tex[i] for i in [0, 1, 2]],
+                nrm = [face.nrm[i] for i in [0, 1, 2]],
+            )
+        else:
+            ret.__dict__.update(
+                pos = [face.pos[i] for i in [0, 2, 3]],
+                tex = [face.tex[i] for i in [0, 2, 3]],
+                nrm = [face.nrm[i] for i in [0, 2, 3]],
+            )
+        return ret

@@ -1,5 +1,6 @@
 import taichi as ti
 import taichi_glsl as ts
+from .light import AmbientLight
 from .transform import *
 import math
 
@@ -8,58 +9,146 @@ EPS = 1e-4
 
 
 @ti.data_oriented
-class Shading:
-    use_postp = False
+class Material:
+    def __init__(self, shader):
+        self.shader = shader
 
-    @ti.func
-    def render_func(self, pos, normal, viewdir, light):
-        raise NotImplementedError
+    def specify_inputs(self, **kwargs):
+        Material.inputs = kwargs
+        return self
+    
+    def __enter__(self):
+        assert hasattr(Material, 'inputs')
+        return self.shader
 
-    @ti.func
-    def post_process(self, color):
-        if ti.static(not self.use_postp):
-            return color
-        blue = ts.vec3(0.00, 0.01, 0.05)
-        orange = ts.vec3(1.19, 1.04, 0.98)
-        return ts.mix(blue, orange, ti.sqrt(color))
+    def __exit__(self, type, val, tb):
+        del Material.inputs
 
+
+@ti.data_oriented
+class MaterialInput:
+    def __init__(self, name):
+        self.name = name
+
+    def get(self):
+        assert hasattr(Material, 'inputs')
+        return Material.inputs[self.name]
+
+
+@ti.data_oriented
+class Node:
+    def __init__(self, **kwargs):
+        self.params = dict(self.get_default_params())
+        self.params.update(kwargs)
+        self._method_level = 0
+
+    @classmethod
+    def get_default_params(cls):
+        return {}
+
+    def __enter__(self):
+        self._method_level += 1
+        if self._method_level <= 1:
+            for k, v in self.params.items():
+                v = v.get()
+                setattr(self, k, v)
+
+    def __exit__(self, type, val, tb):
+        self._method_level -= 1
+        if self._method_level <= 0:
+            for k, v in self.params.items():
+                if hasattr(self, k):
+                    delattr(self, k)
+
+    @staticmethod
+    def method(foo):
+        from functools import wraps
+        @wraps(foo)
+        def wrapped(self, *args, **kwargs):
+            with self:
+                return foo(self, *args, **kwargs)
+
+        return wrapped
+
+
+class Shading(Node):
+    @classmethod
+    def get_default_params(cls):
+        return dict(
+            pos = MaterialInput('pos'),
+            normal = MaterialInput('normal'),
+            model = MaterialInput('model'),
+        )
+
+    @Node.method
     @ti.func
-    def colorize(self, pos, normal):
+    def radiance(self, pos, indir, normal):
+        outdir = indir
+        return pos, outdir, ts.vec3(1.0)
+
+    @Node.method
+    @ti.func
+    def colorize(self):
+        pos = self.pos
+        normal = self.normal
         res = ts.vec3(0.0)
         viewdir = pos.normalized()
-        wpos = self.model.scene.curr_camera.trans_pos(pos)
+        wpos = (self.model.scene.cameras[-1].L2W @ ts.vec4(pos, 1)).xyz  # TODO: get curr camera?
         if ti.static(self.model.scene.lights):
             for light in ti.static(self.model.scene.lights):
                 strength = light.shadow_occlusion(wpos)
-                if strength != 0:
+                if strength >= 1e-3:
                     subclr = self.render_func(pos, normal, viewdir, light)
                     res += strength * subclr
-        res = self.post_process(res)
+        res += self.get_emission()
         return res
 
     @ti.func
-    def render_func(self, pos, normal, viewdir, light):
+    def render_func(self, pos, normal, viewdir, light):  # TODO: move render_func to Light.render_func?
+        if ti.static(isinstance(light, AmbientLight)):
+            return light.get_color(pos) * self.get_ambient()
         lightdir = light.get_dir(pos)
         NoL = ts.dot(normal, lightdir)
         l_out = ts.vec3(0.0)
         if NoL > EPS:
             l_out = light.get_color(pos)
-            l_out *= NoL * self.brdf(normal, -viewdir, lightdir)
+            l_out *= NoL * self.brdf(normal, lightdir, -viewdir)
         return l_out
 
     def brdf(self, normal, lightdir, viewdir):
         raise NotImplementedError
 
+    @ti.func
+    def get_emission(self):
+        return 0
+
+    @ti.func
+    def get_ambient(self):
+        return 0
+
+
 
 class BlinnPhong(Shading):
-    color = 1.0
-    specular = 1.0
-    shineness = 15
+    @classmethod
+    def get_default_params(cls):
+        return dict(
+            pos = MaterialInput('pos'),
+            normal = MaterialInput('normal'),
+            model = MaterialInput('model'),
+            color = Constant(1.0),
+            ambient = Constant(1.0),
+            specular = Constant(1.0),
+            emission = Constant(0.0),
+            shineness = Constant(15),
+        )
 
-    parameters = ['color', 'specular', 'shineness']
+    @ti.func
+    def get_ambient(self):
+        return self.ambient * self.color
 
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
+    @ti.func
+    def get_emission(self):
+        return self.emission
 
     @ti.func
     def brdf(self, normal, lightdir, viewdir):
@@ -71,17 +160,21 @@ class BlinnPhong(Shading):
 
 # https://zhuanlan.zhihu.com/p/37639418
 class CookTorrance(Shading):
-    color = 1.0
-    roughness = 0.3
-    metallic = 0.0
-    specular = 0.04
-    kd = 1.0
-    ks = 1.0
-
-    parameters = ['color', 'roughness', 'metallic']
-
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
+    @classmethod
+    def get_default_params(cls):
+        return dict(
+            pos = MaterialInput('pos'),
+            normal = MaterialInput('normal'),
+            model = MaterialInput('model'),
+            color = Constant(1.0),
+            ambient = Constant(1.0),
+            emission = Constant(0.0),
+            roughness = Constant(0.3),
+            metallic = Constant(0.0),
+            specular = Constant(0.04),
+            kd = Constant(1.0),
+            ks = Constant(1.0),
+            )
 
     @ti.func
     def ischlick(self, cost):
@@ -107,91 +200,150 @@ class CookTorrance(Shading):
         strength = kd * self.color + ks * fdf * vdf * ndf / math.pi
         return strength
 
-
-# References at https://learnopengl.com/PBR/Theory
-# Borrowed from https://github.com/victoriacity/taichimd/blob/1dba9dd825cea33f468ed8516b7e2dc6b8995c41/taichimd/graphics.py#L409
-# All credits by @victoriacity
-class VictoriaCookTorrance(Shading):
-    eps = EPS
-
-    specular = 0.6
-    kd = 1.6
-    ks = 2.0
-    roughness = 0.6
-    metallic = 0.0
-
-    '''
-    Cook-Torrance BRDF with an Lambertian factor.
-    Lo(p, w0)=\int f_c*Li(p, wi)(n.wi)dwi where
-    f_c = k_d*f_lambert * k_s*f_cook-torrance
-    For finite point lights, the integration is evaluated as a
-    discrete sum.
-    '''
-
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
-
-    '''
-    Calculates the Cook-Torrance BRDF as
-    f_lambert = color / pi
-    k_s * f_specular = D * F * G / (4 * (wo.n) * (wi.n))
-    '''
+    @ti.func
+    def get_ambient(self):
+        return self.ambient * self.color
 
     @ti.func
-    def brdf(self, normal, viewdir, lightdir, color):
-        halfway = ts.normalize(viewdir + lightdir)
-        ndotv = max(ti.dot(viewdir, normal), self.eps)
-        ndotl = max(ti.dot(lightdir, normal), self.eps)
-        diffuse = self.kd * color / math.pi
-        specular = self.microfacet(normal, halfway)\
-                    * self.frensel(viewdir, halfway, color)\
-                    * self.geometry(ndotv, ndotl)
-        specular /= 4 * ndotv * ndotl
-        return diffuse + specular
+    def get_emission(self):
+        return self.emission
 
-    '''
-    Trowbridge-Reitz GGX microfacet distribution
-    '''
+
+class IdealRT(Shading):
+    @classmethod
+    def get_default_params(cls):
+        return dict(
+            pos = MaterialInput('pos'),
+            normal = MaterialInput('normal'),
+            model = MaterialInput('model'),
+            indir = MaterialInput('indir'),
+            emission = Constant(0.0),
+            diffuse = Constant(1.0),
+            specular = Constant(0.0),
+            emission_color = Constant(1.0),
+            diffuse_color = Constant(1.0),
+            specular_color = Constant(1.0),
+            )
+
+    @Node.method
     @ti.func
-    def microfacet(self, normal, halfway):
-        alpha = self.roughness
-        ndoth = ts.dot(normal, halfway)
-        ggx = alpha**2 / math.pi
-        ggx /= (ndoth**2 * (alpha**2 - 1.0) + 1.0)**2
-        return ggx
+    def radiance(self):
+        outdir = ts.vec3(0.0)
+        clr = ts.vec3(0.0)
+        if ti.random() < self.emission:
+            clr = ts.vec3(self.emission_color)
+        elif ti.random() < self.specular:
+            clr = ts.vec3(self.specular_color)
+            outdir = ts.reflect(self.indir, self.normal)
+        elif ti.random() < self.diffuse:
+            clr = ts.vec3(self.diffuse_color)
+            outdir = ts.randUnit3D()
+            if outdir.dot(self.normal) < 0:
+                outdir = -outdir
+            #s = ti.random()
+            #outdir = ts.vec3(ti.sqrt(1 - s**2) * ts.randUnit2D(), s)
+            #outdir = ti.Matrix.cols([self.tangent, self.bitangent, self.normal]) @ outdir
+        return self.pos, outdir, clr
 
-    '''
-    Fresnel-Schlick approximation
-    '''
+
+class PlaceHolder(Node):
+    def __init__(self, hint='placeholder'):
+        super().__init__()
+        self.hint = hint
+
+    def get(self):
+        raise NotImplementedError(hint)
+
+
+class Constant(Node):
+    def __init__(self, value):
+        super().__init__()
+        self.value = value
+
+    def get(self):
+        return self.value
+
+
+class Uniform(Node):
+    def __init__(self, dim, dtype, initial=None):
+        super().__init__()
+        self.value = create_field(dim, dtype, (), initial)
+
+    @Node.method
     @ti.func
-    def frensel(self, view, halfway, color):
-        f0 = ts.mix(self.specular, color, self.metallic)
-        hdotv = ts.clamp(ts.dot(halfway, view), 0, 1)
-        return (f0 + (1 - f0) * (1 - hdotv)**5) * self.ks
+    def get(self):
+        return self.value[None]
 
-    '''
-    Smith's method with Schlick-GGX
-    '''
+    def fill(self, value):
+        self.value[None] = value
+
+
+class Texture(Node):
+    @classmethod
+    def get_default_params(cls):
+        return dict(
+            texcoor = MaterialInput('texcoor'),
+            )
+
+    def __init__(self, texture, scale=None):
+        super().__init__()
+
+        if isinstance(texture, str):
+            texture = ti.imread(texture)
+
+        # convert UInt8 into Float32 for storage:
+        if texture.dtype == np.uint8:
+            texture = texture.astype(np.float32) / 255
+        elif texture.dtype == np.float64:
+            texture = texture.astype(np.float32)
+
+        if len(texture.shape) == 3 and texture.shape[2] == 1:
+            texture = texture.reshape(texture.shape[:2])
+
+        # either RGB or greyscale
+        if len(texture.shape) == 2:
+            self.texture = ti.field(float, texture.shape)
+
+        else:
+            assert len(texture.shape) == 3, texture.shape
+            texture = texture[:, :, :3]
+            assert texture.shape[2] == 3, texture.shape
+
+            if scale is not None:
+                if callable(scale):
+                    texture = scale(texture)
+                else:
+                    texture *= np.array(scale)[None, None, ...]
+
+            # TODO: use create_field for this
+            self.texture = ti.Vector.field(3, float, texture.shape[:2])
+
+        @ti.materialize_callback
+        def init_texture():
+            self.texture.from_numpy(texture)
+
+    @Node.method
     @ti.func
-    def geometry(self, ndotv, ndotl):
-        k = (self.roughness + 1)**2 / 8
-        geom = ndotv * ndotl \
-            / (ndotv * (1 - k) + k) / (ndotl * (1 - k) + k)
-        return max(0, geom)
+    def get(self):
+        return ts.bilerp(self.texture, self.texcoor * ts.vec(*self.texture.shape))
+
+    def fill(self, value):
+        self.texture.fill(value)
 
 
-    '''
-    Compared with the basic lambertian-phong shading,
-    the rendering function also takes the surface color as parameter.
-    Also note that the viewdir points from the camera to the object
-    so it needs to be inverted when calculating BRDF.
-    '''
+class NormalMap(Node):
+    @classmethod
+    def get_default_params(cls):
+        return dict(
+            texture = PlaceHolder('texture'),
+            normal = MaterialInput('normal'),
+            tangent = MaterialInput('tangent'),
+            bitangent = MaterialInput('bitangent'),
+            )
+
+    @Node.method
     @ti.func
-    def render_func(self, pos, normal, viewdir, light, color):
-        lightdir = light.get_dir(pos)
-        costheta = max(0, ts.dot(normal, lightdir))
-        l_out = ts.vec3(0.0)
-        if costheta > 0:
-            l_out = self.brdf(normal, -viewdir, lightdir, color) \
-                 * costheta * light.get_color(pos)
-        return l_out
+    def get(self):
+        normal = self.texture * 2 - 1
+        normal = ti.Matrix.cols([self.tangent, self.bitangent, self.normal]) @ normal
+        return normal.normalized()

@@ -15,20 +15,33 @@ def _tri_append(faces, indices):
         assert False, len(indices)
 
 
-def readobj(path, scale=1):
-    if path.endswith('.obj'):
-        ret = read_OBJ(path, scale)
+def readobj(path, orient='xyZ', scale=None):
+    if callable(getattr(path, 'read', 'none')):
+        ret = read_OBJ(path)
+    elif path.endswith('.obj'):
+        ret = read_OBJ(path)
     elif path.endswith('.npz'):
-        ret = read_NPZ(path, scale)
+        ret = read_NPZ(path)
     else:
         assert False, f'Unrecognized file format: {path}'
 
-    if ret['vp'] is not None:
-        ret['vp'] = ret['vp'] * scale
+    if orient is not None:
+        from .objedit import objreorient
+        objreorient(ret, orient)
+
+    if scale is not None:
+        if scale == 'auto':
+            from .objedit import objautoscale
+            objautoscale(ret)
+        else:
+            ret['vp'] = ret['vp'] * scale
+
     return ret
 
 def writeobj(path, obj):
-    if path.endswith('.obj'):
+    if callable(getattr(path, 'write', 'none')):
+        write_OBJ(path, obj)
+    elif path.endswith('.obj'):
         write_OBJ(path, obj)
     elif path.endswith('.npz'):
         write_NPZ(path, obj)
@@ -36,28 +49,33 @@ def writeobj(path, obj):
         assert False, f'Unrecognized file format: {path}'
 
 
-def read_OBJ(path, scale=1):
+def read_OBJ(path):
     vp = []
     vt = []
     vn = []
     faces = []
 
-    with open(path, 'r') as myfile:
-        lines = myfile.readlines()
+    if callable(getattr(path, 'read', 'none')):
+        lines = path.readlines()
+    else:
+        with open(path, 'rb') as myfile:
+            lines = myfile.readlines()
 
     # cache vertices
     for line in lines:
+        line = line.strip()
+        assert isinstance(line, bytes), f'BytesIO expected! (got {type(line)})'
         try:
             type, fields = line.split(maxsplit=1)
             fields = [float(_) for _ in fields.split()]
         except ValueError:
             continue
 
-        if type == 'v':
+        if type == b'v':
             vp.append(fields)
-        elif type == 'vt':
+        elif type == b'vt':
             vt.append(fields)
-        elif type == 'vn':
+        elif type == b'vn':
             vn.append(fields)
 
     # cache faces
@@ -70,26 +88,30 @@ def read_OBJ(path, scale=1):
 
         # line looks like 'f 5/1/1 1/2/1 4/3/1'
         # or 'f 314/380/494 382/400/494 388/550/494 506/551/494' for quads
-        if type != 'f':
+        if type != b'f':
             continue
 
         # a field should look like '5/1/1'
         # for vertex/vertex UV coords/vertex Normal  (indexes number in the list)
         # the index in 'f 5/1/1 1/2/1 4/3/1' STARTS AT 1 !!!
-        indices = [[int(_) - 1 for _ in field.split('/')] for field in fields]
+        indices = [[int(_) - 1 if _ else 0 for _ in field.split(b'/')] for field in fields]
 
         _tri_append(faces, indices)
 
     ret = {}
-    ret['vp'] = None if len(vp) == 0 else np.array(vp).astype(np.float32) * scale
-    ret['vt'] = None if len(vt) == 0 else np.array(vt).astype(np.float32)
-    ret['vn'] = None if len(vn) == 0 else np.array(vn).astype(np.float32)
-    ret['f'] = None if len(faces) == 0 else np.array(faces).astype(np.int32)
+    ret['vp'] = np.array([[0, 0, 0]], dtype=np.float32) if len(vp) == 0 else np.array(vp, dtype=np.float32)
+    ret['vt'] = np.array([[0, 0]], dtype=np.float32) if len(vt) == 0 else np.array(vt, dtype=np.float32)
+    ret['vn'] = np.array([[0, 0, 0]], dtype=np.float32) if len(vn) == 0 else np.array(vn, dtype=np.float32)
+    ret['f'] = np.zeros((1, 3, 3), dtype=np.int32) if len(faces) == 0 else np.array(faces, dtype=np.int32)
     return ret
 
 
 def write_OBJ(path, obj, name='Object'):
-    with open(path, 'w') as f:
+    if callable(getattr(path, 'write', 'none')):
+        f = path
+    else:
+        f = open(path, 'w')
+    with f:
         f.write('# Taichi THREE saved OBJ file\n')
         f.write('# https://github.com/taichi-dev/taichi-three\n')
         f.write(f'o {name}\n')
@@ -112,11 +134,11 @@ def write_NPZ(path, obj):
     data['f'] = obj['f'].astype(np.uint16)
     np.savez(path, **data)
 
-def read_NPZ(path, scale=1):
+def read_NPZ(path):
     data = np.load(path)
 
     ret = {}
-    ret['vp'] = data['vp'] * scale
+    ret['vp'] = data['vp']
     ret['vt'] = data['vt']
     ret['vn'] = data['vn'].astype(np.float32) / (2**15 - 1)
     ret['f'] = data['f'].astype(np.int32)

@@ -151,6 +151,8 @@ class Main:
                 type=int, help='Specify window width')
         parser.add_argument('-v', '--resy', default=512,
                 type=int, help='Specify window height')
+        parser.add_argument('-A', '--ambient', default=0,
+                type=float, help='Specify ambient light strength')
         parser.add_argument('-o', '--ortho',
                 action='store_true', help='Display in orthogonal mode')
         parser.add_argument('-l', '--lowp',
@@ -169,6 +171,10 @@ class Main:
                 action='store_true', help='Including both face, no culling')
         parser.add_argument('-N', '--renorm',
                 action='store_true', help='Reset normal vectors to flat')
+        parser.add_argument('-S', '--showhints',
+                action='store_true', help='Show information about pixel under cursor')
+        parser.add_argument('-T', '--taa', default=True,
+                action='store_true', help='Enable temporal anti-aliasing')
         parser.add_argument('-t', '--texture',
                 type=str, help='Path to texture to bind')
         parser.add_argument('-n', '--normtex',
@@ -188,8 +194,10 @@ class Main:
         ti.init(getattr(ti, args.arch))
 
         scene = t3.Scene()
-        obj = t3.readobj(args.filename, scale=args.scale)
+        obj = t3.readobj(args.filename, scale=args.scale if args.scale != 0 else 1)
         t3.objflipaxis(obj, args.flipx, args.flipy, args.flipz)
+        if args.scale == 0:
+            t3.objautoscale(obj)
         if args.flipface:
             t3.objflipface(obj)
         if args.flipnorm:
@@ -209,11 +217,18 @@ class Main:
         if args.roughness is not None:
             model.add_texture('roughness', ti.imread(args.roughness))
         scene.add_model(model)
-        camera = t3.Camera(res=(args.resx, args.resy))
+        camera = t3.Camera(res=(args.resx, args.resy), taa=args.taa)
+        if args.showhints:
+            camera.fb.add_buffer('pos', 3)
+            camera.fb.add_buffer('texcoor', 2)
+            camera.fb.add_buffer('normal', 3)
         if args.ortho:
             camera.type = camera.ORTHO
         scene.add_camera(camera)
-        light = t3.Light([0.4, -1.5, 0.8])
+        if args.ambient:
+            light = t3.AmbientLight(args.ambient)
+        else:
+            light = t3.Light([0.4, -1.5, 0.8])
         scene.add_light(light)
 
         gui = ti.GUI('Model', camera.res)
@@ -223,6 +238,14 @@ class Main:
             camera.from_mouse(gui)
             scene.render()
             gui.set_image(camera.img)
+            if args.showhints:
+                coor = gui.get_cursor_pos()
+                pos = camera.fb.fetchpixelinfo('pos', coor)
+                color = camera.fb.fetchpixelinfo('img', coor)
+                texcoor = camera.fb.fetchpixelinfo('texcoor', coor)
+                normal = camera.fb.fetchpixelinfo('normal', coor)
+                gui.text(f'color: [{color.x:.2f} {color.y:.2f} {color.z:.2f}]; pos: [{pos.x:+.2f} {pos.y:+.2f} {pos.z:+.2f}]', (0, 1))
+                gui.text(f'texcoor: [{texcoor.x:.2f} {texcoor.y:.2f}]; normal: [{normal.x:+.2f} {normal.y:+.2f} {normal.z:+.2f}]', (0, 1 - 16 / camera.res[1]))
             gui.show()
 
     @register

@@ -11,7 +11,7 @@ import math
 
 class ScatterModel(ModelBase):
     def __init__(self, num=None):
-        self.L2W = Affine.field(())
+        super().__init__()
 
         self.num = num
 
@@ -23,9 +23,6 @@ class ScatterModel(ModelBase):
             def initialize_radius():
                 self.radius.fill(1.0)
 
-    def _init(self):
-        self.L2W.init()
-
     @ti.func
     def render(self, camera):
         for i in ti.grouped(self.pos):
@@ -33,6 +30,5 @@ class ScatterModel(ModelBase):
 
     @ti.func
     def colorize(self, pos, normal):
-        opt = CookTorrance()
-        opt.model = ti.static(self)
-        return opt.colorize(pos, normal)
+        with self.material.specify_inputs(model=self, pos=pos, texcoor=None, normal=normal, tangent=None, bitangent=None) as shader:
+            return shader.colorize()
